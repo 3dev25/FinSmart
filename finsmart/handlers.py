@@ -141,16 +141,22 @@ async def cash_rules(m:Message,s:FSMContext):
             return await m.answer("Добавьте хотя бы одно правило перед завершением.")
         rows=[Expense(Decimal(x["amount"]),x["category"],x["description"],x["date"])
               for x in data["expenses"]]
-        results=compare_rules(rows,[CashbackRule(**rule) for rule in data["rules"]])
+        results=compare_rules(rows,[
+            CashbackRule(
+                name=rule["name"],category=rule["category"],
+                rate_percent=Decimal(rule["rate_percent"]),
+                monthly_cap=Decimal(rule["monthly_cap"]) if rule["monthly_cap"] is not None else None
+            ) for rule in data["rules"]
+        ])
         await s.clear()
         await save_data(
             m.from_user.id,"cashback",
             {"rules":data["rules"],"rows":len(rows)}
         )
         lines=["Сравнение введённых условий кэшбэка:"]
-        for item in results:
+        for item,rule in zip(results,data["rules"]):
             lines.append(
-                f"{item.category}: {item.cashback:,.2f} ₽; "
+                f"{rule['name']} ({item.category}, {rule['rate_percent']}%): {item.cashback:,.2f} ₽; "
                 f"подходящие расходы {item.eligible_spend:,.2f} ₽; "
                 f"упущено относительно лучшего правила этой категории "
                 f"{item.lost_cashback:,.2f} ₽"
@@ -172,14 +178,12 @@ async def cash_rules(m:Message,s:FSMContext):
     try:
         rate=dec(parts[1])
         cap=dec(parts[2])
-        if not D(0)<=rate<=D(100) or cap<0:
+        if not Decimal("0")<=rate<=Decimal("100") or cap<0:
             raise ValueError()
     except Exception:
         return await m.answer("Ставка должна быть 0–100%, лимит — неотрицательным числом.")
     rules=data.get("rules",[])
-    if any(rule["category"].casefold()==category.casefold() for rule in rules):
-        return await m.answer("Для этой категории правило уже добавлено. Сравнивайте варианты по одному правилу на категорию.")
-    rules.append({
+        rules.append({
         "name":f"Условие {len(rules)+1}",
         "category":category,
         "rate_percent":str(rate),
