@@ -34,6 +34,7 @@ class CashbackResult:
     eligible_spend: Decimal
     cashback: Decimal
     lost_cashback: Decimal
+    rule_name: str = ""
 
 
 def _validate_rule(rule: CashbackRule):
@@ -129,7 +130,7 @@ def evaluate_rule(expenses: Iterable[Expense], rule: CashbackRule) -> CashbackRe
         ),
         D(0),
     )
-    return CashbackResult(rule.category, eligible_spend, cashback.quantize(CENT), D(0))
+    return CashbackResult(rule.category, eligible_spend, cashback.quantize(CENT), D(0), rule.name)
 
 
 def compare_rules(expenses: Iterable[Expense], rules: list[CashbackRule]) -> list[CashbackResult]:
@@ -146,6 +147,7 @@ def compare_rules(expenses: Iterable[Expense], rules: list[CashbackRule]) -> lis
             result.eligible_spend,
             result.cashback,
             max(D(0), best_by_category[result.category.casefold()] - result.cashback),
+            result.rule_name,
         )
         for result in results
     ]
