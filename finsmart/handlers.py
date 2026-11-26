@@ -94,7 +94,7 @@ async def r7(m:Message,s:FSMContext):
     except Exception:return await m.answer("Введите неотрицательную сумму.")
     d=await s.get_data();await s.clear();r=compare_refinance(Decimal(d['balance']),Decimal(d['old_rate']),int(d['old_months']),Decimal(d['new_rate']),int(d['new_months']),Decimal(d['fees']),v);fmt=lambda x:f"{x:,.2f} ₽".replace(","," ")
     await save_data(m.from_user.id,"refinance",d|{"insurance":str(v)})
-    await m.answer(f"Текущий кредит: {fmt(r.current_total)}\\nНовый кредит и расходы: {fmt(r.new_total)}\\nЧистая выгода: {fmt(r.net_saving)}\\nОкупаемость расходов: {r.break_even_month or 'не достигнута'} мес.",reply_markup=menu)
+    await m.answer(f"Текущий кредит: {fmt(r.current_total)}\\nНовый кредит и расходы: {fmt(r.new_total)}\\nЧистая выгода: {fmt(r.net_saving)}\\nОкупаемость расходов: {r.break_even_month if r.break_even_month is not None else 'не достигнута'} мес.",reply_markup=menu)
 @router.message(Command("cashback"))
 @router.message(F.text=="🎁 Оптимизатор кэшбэка")
 async def cash_start(m:Message,s:FSMContext):await s.clear();await s.set_state(Cash.csv);await m.answer("Пришлите CSV расходов. Нужны столбцы суммы и категории. Удалите банковские реквизиты.")
