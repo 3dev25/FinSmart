@@ -154,9 +154,9 @@ async def cash_rules(m:Message,s:FSMContext):
             {"rules":data["rules"],"rows":len(rows)}
         )
         lines=["Сравнение введённых условий кэшбэка:"]
-        for item,rule in zip(results,data["rules"]):
+        for item in results:
             lines.append(
-                f"{rule['name']} ({item.category}, {rule['rate_percent']}%): {item.cashback:,.2f} ₽; "
+                f"{item.rule_name} ({item.category}): {item.cashback:,.2f} ₽; "
                 f"подходящие расходы {item.eligible_spend:,.2f} ₽; "
                 f"упущено относительно лучшего правила этой категории "
                 f"{item.lost_cashback:,.2f} ₽"
@@ -183,7 +183,7 @@ async def cash_rules(m:Message,s:FSMContext):
     except Exception:
         return await m.answer("Ставка должна быть 0–100%, лимит — неотрицательным числом.")
     rules=data.get("rules",[])
-        rules.append({
+    rules.append({
         "name":f"Условие {len(rules)+1}",
         "category":category,
         "rate_percent":str(rate),
