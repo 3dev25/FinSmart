@@ -1,59 +1,199 @@
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-D=Decimal
-CENT=D("0.01")
-def money(x): return x.quantize(CENT,rounding=ROUND_HALF_UP)
+
+D = Decimal
+CENT = D("0.01")
+ZERO = D("0")
+
+
+def as_decimal(value) -> Decimal:
+    return value if isinstance(value, Decimal) else D(str(value))
+
+
+def money(value: Decimal) -> Decimal:
+    return as_decimal(value).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
 @dataclass(frozen=True)
 class Loan:
     principal: Decimal
     annual_rate_percent: Decimal
     months: int
+
     def validate(self):
-        if self.principal<=0 or self.annual_rate_percent<0 or not 1<=self.months<=600: raise ValueError("Проверьте сумму, ставку и срок кредита.")
+        principal = as_decimal(self.principal)
+        rate = as_decimal(self.annual_rate_percent)
+        if principal <= ZERO or rate < ZERO or rate > D("1000") or not 1 <= self.months <= 600:
+            raise ValueError("Проверьте сумму, ставку (0–1000%) и срок кредита (1–600 месяцев).")
+
+
 @dataclass(frozen=True)
 class Payment:
-    month:int; payment:Decimal; principal:Decimal; interest:Decimal; balance:Decimal
+    month: int
+    payment: Decimal
+    principal: Decimal
+    interest: Decimal
+    balance: Decimal
+
+
 @dataclass(frozen=True)
 class Schedule:
-    payments:tuple[Payment,...]; total_interest:Decimal; total_paid:Decimal; final_month:int; monthly_payment:Decimal
-def annuity_payment(principal,annual_rate_percent,months):
-    if principal<=0 or months<=0: raise ValueError("Сумма и срок должны быть положительными.")
-    r=annual_rate_percent/D("1200")
-    if r==0:return money(principal/D(months))
-    f=(D(1)+r)**months
-    return money(principal*r*f/(f-D(1)))
-def build_schedule(loan,extra_by_month=None,reduce_term=True):
-    loan.validate(); extra_by_month=extra_by_month or {}; r=loan.annual_rate_percent/D("1200")
-    regular=annuity_payment(loan.principal,loan.annual_rate_percent,loan.months); balance=loan.principal; rows=[]; ti=D(0); tp=D(0)
-    for month in range(1,loan.months+601):
-        interest=money(balance*r); due=min(balance,regular-interest); extra=max(D(0),extra_by_month.get(month,D(0))); principal=min(balance,due+extra); payment=money(interest+principal); balance=max(D(0),balance-principal); ti+=interest; tp+=payment
-        rows.append(Payment(month,payment,money(principal),interest,money(balance)))
-        if balance<=D("0.005") or (not reduce_term and month>=loan.months):break
-    return Schedule(tuple(rows),money(ti),money(tp),len(rows),regular)
+    payments: tuple[Payment, ...]
+    total_interest: Decimal
+    total_paid: Decimal
+    final_month: int
+    monthly_payment: Decimal
+
+
+def annuity_payment(principal, annual_rate_percent, months):
+    principal = as_decimal(principal)
+    rate = as_decimal(annual_rate_percent)
+    if principal <= ZERO or months <= 0:
+        raise ValueError("Сумма и срок должны быть положительными.")
+    if rate < ZERO:
+        raise ValueError("Ставка не может быть отрицательной.")
+    monthly_rate = rate / D("1200")
+    if monthly_rate == ZERO:
+        return money(principal / D(months))
+    factor = (D(1) + monthly_rate) ** months
+    return money(principal * monthly_rate * factor / (factor - D(1)))
+
+
+def build_schedule(loan: Loan, extra_by_month=None, reduce_term=True):
+    loan.validate()
+    extra_by_month = extra_by_month or {}
+    principal = as_decimal(loan.principal)
+    rate = as_decimal(loan.annual_rate_percent)
+    monthly_rate = rate / D("1200")
+    regular_payment = annuity_payment(principal, rate, loan.months)
+    balance = principal
+    rows = []
+    total_interest = ZERO
+    total_paid = ZERO
+
+    for month in range(1, loan.months + 601):
+        interest = money(balance * monthly_rate)
+        scheduled_principal = max(ZERO, regular_payment - interest)
+        extra = max(ZERO, as_decimal(extra_by_month.get(month, ZERO)))
+        principal_paid = min(balance, scheduled_principal + extra)
+        payment = money(interest + principal_paid)
+        balance = max(ZERO, balance - principal_paid)
+        total_interest += interest
+        total_paid += payment
+        rows.append(Payment(month, payment, money(principal_paid), interest, money(balance)))
+        if balance <= D("0.005") or (not reduce_term and month >= loan.months):
+            break
+
+    return Schedule(
+        tuple(rows), money(total_interest), money(total_paid),
+        len(rows), regular_payment
+    )
+
+
 @dataclass(frozen=True)
 class PrepaymentComparison:
-    baseline:Schedule; reduce_term:Schedule; reduce_payment:Schedule; interest_saved_term:Decimal; interest_saved_payment:Decimal
-def compare_prepayment(loan,extra_monthly,first_extra_month=1):
+    baseline: Schedule
+    reduce_term: Schedule
+    reduce_payment: Schedule
+    interest_saved_term: Decimal
+    interest_saved_payment: Decimal
+
+
+def _reduced_payment_schedule(loan: Loan, extra_monthly: Decimal, first_extra_month: int):
+    balance = as_decimal(loan.principal)
+    rate = as_decimal(loan.annual_rate_percent)
+    monthly_rate = rate / D("1200")
+    rows = []
+    total_interest = ZERO
+    total_paid = ZERO
+
+    for month in range(1, loan.months + 1):
+        remaining_months = loan.months - month + 1
+        # The required instalment is recalculated against the remaining balance
+        # and original maturity. The voluntary extra is then applied to principal.
+        regular = annuity_payment(balance, rate, remaining_months)
+        interest = money(balance * monthly_rate)
+        scheduled_principal = max(ZERO, regular - interest)
+        extra = extra_monthly if month >= first_extra_month else ZERO
+        principal_paid = min(balance, scheduled_principal + extra)
+        payment = money(interest + principal_paid)
+        balance = max(ZERO, balance - principal_paid)
+        total_interest += interest
+        total_paid += payment
+        rows.append(Payment(month, payment, money(principal_paid), interest, money(balance)))
+        if balance <= D("0.005"):
+            break
+
+    return Schedule(tuple(rows), money(total_interest), money(total_paid), len(rows),
+                    annuity_payment(loan.principal, rate, loan.months))
+
+
+def compare_prepayment(loan: Loan, extra_monthly, first_extra_month=1):
     loan.validate()
-    if extra_monthly<0 or first_extra_month<1: raise ValueError("Некорректная доплата.")
-    base=build_schedule(loan); extra={m:extra_monthly for m in range(first_extra_month,loan.months+1)}
-    term=build_schedule(loan,extra,True)
-    # Recalculate required annuity after each extra payment, keeping the original final month.
-    balance=loan.principal; r=loan.annual_rate_percent/D("1200"); rows=[]; ti=D(0); tp=D(0)
-    for month in range(1,loan.months+1):
-        interest=money(balance*r); remaining=loan.months-month+1; regular=annuity_payment(balance,loan.annual_rate_percent,remaining)
-        due=min(balance,max(D(0),regular-interest)); extra_now=extra_monthly if month>=first_extra_month else D(0); principal=min(balance,due+extra_now); pay=money(interest+principal); balance=max(D(0),balance-principal); ti+=interest; tp+=pay; rows.append(Payment(month,pay,money(principal),interest,money(balance)))
-        if balance<=D("0.005"):break
-    reduced=Schedule(tuple(rows),money(ti),money(tp),len(rows),base.monthly_payment)
-    return PrepaymentComparison(base,term,reduced,money(base.total_interest-term.total_interest),money(base.total_interest-reduced.total_interest))
+    extra_monthly = as_decimal(extra_monthly)
+    if extra_monthly < ZERO or not 1 <= first_extra_month <= loan.months:
+        raise ValueError("Некорректная сумма или месяц начала досрочных платежей.")
+    baseline = build_schedule(loan)
+    extra_by_month = {
+        month: extra_monthly
+        for month in range(first_extra_month, loan.months + 1)
+    }
+    shorter = build_schedule(loan, extra_by_month, reduce_term=True)
+    lower_payment = _reduced_payment_schedule(loan, extra_monthly, first_extra_month)
+    return PrepaymentComparison(
+        baseline,
+        shorter,
+        lower_payment,
+        money(baseline.total_interest - shorter.total_interest),
+        money(baseline.total_interest - lower_payment.total_interest),
+    )
+
+
 @dataclass(frozen=True)
 class RefinanceResult:
-    current_total:Decimal; new_total:Decimal; net_saving:Decimal; break_even_month:int|None; current_schedule:Schedule; new_schedule:Schedule
-def compare_refinance(current_balance,current_rate,current_months,new_rate,new_months,fees=D(0),insurance=D(0),monthly_fee=D(0)):
-    current=build_schedule(Loan(current_balance,current_rate,current_months)); new=build_schedule(Loan(current_balance,new_rate,new_months)); current_cost=current.total_paid; new_cost=new.total_paid+fees+insurance+monthly_fee*D(new_months)
-    old=D(0); fresh=fees+insurance; be=0 if fresh<=0 else None
-    for i in range(max(len(current.payments),len(new.payments))):
-        if i<len(current.payments):old+=current.payments[i].payment
-        if i<len(new.payments):fresh+=new.payments[i].payment+monthly_fee
-        if be is None and fresh<=old:be=i+1
-    return RefinanceResult(money(current_cost),money(new_cost),money(current_cost-new_cost),be,current,new)
+    current_total: Decimal
+    new_total: Decimal
+    net_saving: Decimal
+    break_even_month: int | None
+    current_schedule: Schedule
+    new_schedule: Schedule
+
+
+def compare_refinance(
+    current_balance, current_rate, current_months,
+    new_rate, new_months, fees=ZERO, insurance=ZERO, monthly_fee=ZERO
+):
+    fees = as_decimal(fees)
+    insurance = as_decimal(insurance)
+    monthly_fee = as_decimal(monthly_fee)
+    if min(fees, insurance, monthly_fee) < ZERO:
+        raise ValueError("Комиссии, страховка и ежемесячные расходы не могут быть отрицательными.")
+
+    current_loan = Loan(as_decimal(current_balance), as_decimal(current_rate), current_months)
+    new_loan = Loan(as_decimal(current_balance), as_decimal(new_rate), new_months)
+    current = build_schedule(current_loan)
+    new = build_schedule(new_loan)
+
+    current_total = current.total_paid
+    new_total = money(new.total_paid + fees + insurance + monthly_fee * D(new_months))
+
+    # Expenses for the new loan include one-off costs at month zero.
+    # Break-even is the first month when cumulative new-loan outflow
+    # becomes no greater than cumulative payments on the existing loan.
+    old_cumulative = ZERO
+    new_cumulative = fees + insurance
+    break_even = 0 if new_cumulative == ZERO else None
+    horizon = max(len(current.payments), len(new.payments))
+
+    for index in range(horizon):
+        if index < len(current.payments):
+            old_cumulative += current.payments[index].payment
+        if index < len(new.payments):
+            new_cumulative += new.payments[index].payment + monthly_fee
+        if break_even is None and new_cumulative <= old_cumulative:
+            break_even = index + 1
+
+    return RefinanceResult(
+        money(current_total), new_total, money(current_total - new_total),
+        break_even, current, new
+    )
