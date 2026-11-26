@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy import select,delete
 from finsmart.db import Session,User,UserData
 from finsmart.calculators import Loan,compare_prepayment,compare_refinance
-from finsmart.cashback import parse_expenses_csv,Expense,CashbackRule,evaluate_rule
+from finsmart.cashback import parse_expenses_csv,Expense,CashbackRule,compare_rules
 router=Router()
 menu=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="💸 Досрочное погашение"),KeyboardButton(text="🔁 Рефинансирование")],[KeyboardButton(text="🎁 Оптимизатор кэшбэка"),KeyboardButton(text="ℹ️ Помощь")]],resize_keyboard=True)
 def dec(s):
@@ -19,7 +19,7 @@ async def save_data(uid,kind,payload):
         db.add(UserData(telegram_id=uid,kind=kind,payload=payload));await db.commit()
 class Prepay(StatesGroup): principal=State();rate=State();months=State();extra=State()
 class Refi(StatesGroup): balance=State();old_rate=State();old_months=State();new_rate=State();new_months=State();fees=State();insurance=State()
-class Cash(StatesGroup): csv=State();category=State();rate=State();cap=State()
+class Cash(StatesGroup): csv=State();rules=State()
 @router.message(Command("start"))
 async def start(m:Message,s:FSMContext):
     await s.clear();await m.answer("FinSmart — расчёты по кредитам и кэшбэку. Все ставки и условия вводите самостоятельно.\\n\\nВыберите инструмент.",reply_markup=menu)
@@ -100,31 +100,98 @@ async def r7(m:Message,s:FSMContext):
 async def cash_start(m:Message,s:FSMContext):await s.clear();await s.set_state(Cash.csv);await m.answer("Пришлите CSV расходов. Нужны столбцы суммы и категории. Удалите банковские реквизиты.")
 @router.message(Cash.csv,F.document)
 async def cash_file(m:Message,s:FSMContext):
-    if m.document.file_size and m.document.file_size>5_000_000:return await m.answer("Максимальный размер CSV — 5 МБ.")
-    f=await m.bot.get_file(m.document.file_id);stream=await m.bot.download_file(f.file_path)
-    try:rows=parse_expenses_csv(stream.read())
-    except Exception as e:return await m.answer(f"Ошибка CSV: {e}")
-    if not rows:return await m.answer("В CSV не найдены расходы.")
-    await s.update_data(expenses=[{"amount":str(x.amount),"category":x.category,"description":x.description,"date":x.date} for x in rows]);await s.set_state(Cash.category)
-    await m.answer("Категории в файле:\\n"+"\\n".join(sorted({x.category for x in rows}))+"\\nВведите точное название категории:")
+    if m.document.file_size and m.document.file_size>5_000_000:
+        return await m.answer("Максимальный размер CSV — 5 МБ.")
+    f=await m.bot.get_file(m.document.file_id)
+    stream=await m.bot.download_file(f.file_path)
+    try:
+        rows=parse_expenses_csv(stream.read())
+    except Exception as e:
+        return await m.answer(f"Ошибка CSV: {e}")
+    if not rows:
+        return await m.answer("В CSV не найдены расходы.")
+    categories=sorted({x.category for x in rows})
+    await s.update_data(
+        expenses=[{"amount":str(x.amount),"category":x.category,
+                   "description":x.description,"date":x.date} for x in rows],
+        rules=[]
+    )
+    await s.set_state(Cash.rules)
+    await m.answer(
+        "Категории в файле:\\n"+"\\n".join(categories)+
+        "\\n\\nДобавляйте правила по одному сообщению в формате:\\n"
+        "Категория; ставка%; месячный лимит ₽\\n"
+        "Пример: Супермаркеты; 5; 1500\\n"
+        "Лимит 0 означает без лимита. Напишите ГОТОВО, когда внесёте все правила."
+    )
+
+
 @router.message(Cash.csv)
-async def cash_wrong(m:Message):await m.answer("Прикрепите CSV-файл документом.")
-@router.message(Cash.category)
-async def cash_cat(m:Message,s:FSMContext):
-    d=await s.get_data();cats={x['category'].casefold():x['category'] for x in d['expenses']}
-    if not m.text or m.text.casefold() not in cats:return await m.answer("Введите категорию точно как в списке.")
-    await s.update_data(category=cats[m.text.casefold()]);await s.set_state(Cash.rate);await m.answer("Ставка кэшбэка в %:")
-@router.message(Cash.rate)
-async def cash_rate(m:Message,s:FSMContext):
-    try:v=dec(m.text);assert 0<=v<=100
-    except Exception:return await m.answer("Введите ставку от 0 до 100.")
-    await s.update_data(rate=str(v));await s.set_state(Cash.cap);await m.answer("Месячный лимит в ₽ (0 — без лимита):")
-@router.message(Cash.cap)
-async def cash_cap(m:Message,s:FSMContext):
-    try:cap=dec(m.text);assert cap>=0
-    except Exception:return await m.answer("Введите неотрицательную сумму.")
-    d=await s.get_data();rows=[Expense(Decimal(x['amount']),x['category'],x['description'],x['date']) for x in d['expenses']];rule=CashbackRule("Введённое условие",d['category'],Decimal(d['rate']),None if cap==0 else cap);r=evaluate_rule(rows,rule);await s.clear();await save_data(m.from_user.id,"cashback",{"category":d['category'],"rate":d['rate'],"cap":str(cap),"rows":len(rows)})
-    await m.answer(f"Категория: {r.category}\\nПодходящие расходы: {r.eligible_spend:,.2f} ₽\\nОжидаемый кэшбэк: {r.cashback:,.2f} ₽\\n\\nРасчёт ориентировочный; без MCC банковские исключения проверить нельзя.",reply_markup=menu)
+async def cash_wrong(m:Message):
+    await m.answer("Прикрепите CSV-файл документом.")
+
+
+@router.message(Cash.rules)
+async def cash_rules(m:Message,s:FSMContext):
+    if not m.text:
+        return await m.answer("Отправьте правило текстом или напишите ГОТОВО.")
+    if m.text.strip().casefold() in {"готово","готов"}:
+        data=await s.get_data()
+        if not data.get("rules"):
+            return await m.answer("Добавьте хотя бы одно правило перед завершением.")
+        rows=[Expense(Decimal(x["amount"]),x["category"],x["description"],x["date"])
+              for x in data["expenses"]]
+        results=compare_rules(rows,[CashbackRule(**rule) for rule in data["rules"]])
+        await s.clear()
+        await save_data(
+            m.from_user.id,"cashback",
+            {"rules":data["rules"],"rows":len(rows)}
+        )
+        lines=["Сравнение введённых условий кэшбэка:"]
+        for item in results:
+            lines.append(
+                f"{item.category}: {item.cashback:,.2f} ₽; "
+                f"подходящие расходы {item.eligible_spend:,.2f} ₽; "
+                f"упущено относительно лучшего правила этой категории "
+                f"{item.lost_cashback:,.2f} ₽"
+            )
+        lines.append(
+            "\\nРасчёт ориентировочный: без MCC и полных банковских условий "
+            "нельзя проверить исключения, округление и дополнительные ограничения."
+        )
+        return await m.answer("\\n".join(lines),reply_markup=menu)
+
+    parts=[part.strip() for part in m.text.split(";")]
+    if len(parts)!=3:
+        return await m.answer("Нужен формат: Категория; ставка%; месячный лимит ₽")
+    data=await s.get_data()
+    categories={x["category"].casefold():x["category"] for x in data["expenses"]}
+    category=categories.get(parts[0].casefold())
+    if not category:
+        return await m.answer("Категория должна точно совпадать с одной из категорий CSV.")
+    try:
+        rate=dec(parts[1])
+        cap=dec(parts[2])
+        if not D(0)<=rate<=D(100) or cap<0:
+            raise ValueError()
+    except Exception:
+        return await m.answer("Ставка должна быть 0–100%, лимит — неотрицательным числом.")
+    rules=data.get("rules",[])
+    if any(rule["category"].casefold()==category.casefold() for rule in rules):
+        return await m.answer("Для этой категории правило уже добавлено. Сравнивайте варианты по одному правилу на категорию.")
+    rules.append({
+        "name":f"Условие {len(rules)+1}",
+        "category":category,
+        "rate_percent":str(rate),
+        "monthly_cap":None if cap==0 else str(cap),
+    })
+    await s.update_data(rules=rules)
+    await m.answer(
+        f"Добавлено: {category}, {rate}%"
+        +(f", лимит {cap:,.2f} ₽" if cap else ", без лимита")
+        +". Добавьте следующее правило или напишите ГОТОВО."
+    )
+
 @router.message(Command("help"))
 @router.message(F.text=="ℹ️ Помощь")
 async def help_msg(m:Message):await m.answer("/prepay — досрочное погашение\\n/refinance — рефинансирование\\n/cashback — кэшбэк по CSV\\n/privacy — данные\\n/delete_me — удалить данные",reply_markup=menu)
